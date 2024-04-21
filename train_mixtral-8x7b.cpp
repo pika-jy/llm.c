@@ -8,6 +8,7 @@ This is the C++ version of the Mixtral-8x7B model.
 #include <vector>
 #include <memory>
 #include <algorithm>
+#include <numeric>
 #include <functional>
 #ifdef OMP
 #include <omp.h>
@@ -66,9 +67,38 @@ namespace llm {
         void forward() {}
     };
 
+    template <typename T>
     class Softmax: public Module {
     public:
-        void forward() {}
+        void forward(vector<vector<vector<T>>>& probs,
+                     const vector<vector<vector<T>>>& logits,
+                     int B, int T, int V) {
+            /*
+            output: probs, (B, T, V) of the probabilities (sums to 1.0 in each b,t position)
+            input: logits, (B, T, V) of the unnormalized log probabilities
+            */
+            #pragma omp parallel for collapse(2)
+            vector<float> submax(V, 0.0f);
+            for (int b = 0; b < B; ++b) {
+                for (int t = 0; t < T, ++t) {
+                    submax.clear();
+
+                    // softmax(logits) -> probs
+                    const auto& logits_bt = logits[b][t];
+                    auto& probs_bt = probs[b][t];
+
+                    // safe softmax (subtract maxval)
+                    auto maxval = max(logits_bt.cbegin(), logits_bt.cend());
+                    for (int i = 0; i < V; ++i) {
+                        submax[i] = logits_bt[i] - maxval;
+                    }
+                    auto sum = accumulate(submax);
+                    for (int i = 0; i < V; ++i) {
+                        submax[i] /= sum;
+                    }
+                }
+            }
+        }
     };
 }
 
@@ -201,6 +231,18 @@ void mixtral_free() {
 
 // ----------------------------------------------------------------------------
 // sampler
+int sample_mult(const vector<float>& probabilities, int n, float coin) {
+    // sample index from probabilities (they must sum to 1!)
+    // coin is a random number in [0, 1), usually from random_f32()
+    float cdf = 0.0f;
+    for (int i = 0; i < n; i++) {
+        cdf += probabilities[i];
+        if (coin < cdf) {
+            return i;
+        }
+    }
+    return n - 1; // in case of rounding errors
+}
 
 // the Mixtral-8x7B end-of-text token id
 #define Mixtral_EOT 50256
@@ -209,9 +251,9 @@ void mixtral_free() {
 // Tokenizer (only supports decoding)
 class Tokenizer {
 public:
-    void print() {}
+    void print(string) {}
     void init(const string& filename) {}
-    void decode() {}
+    string decode() {}
 
     uint32_t vocab_size;
     vector<string> token_table;
@@ -226,11 +268,38 @@ int main() {
     // model url: https://huggingface.co/mistralai/Mixtral-8x7B-v0.1
     mixtral_build_from_checkpoint(model_ptr, "mistralai/Mixtral-8x7B-v0.1");
 
+    // build the inputs
+    int B = 32;
+    int T = 128;
+
     // build the Tokenizer
     Tokenizer tokenizer;
-    tokenizer.init("gpt2_tokenizer.bin");
+    tokenizer.init("mixtral_tokenizer.bin");
+
+    vector<vector<int>> inputs;
+    vector<vector<int>> gen_tokens(B, vector<int>(T, Mixtral_EOT));
+    constexpr int genT = 128;
 
     // inference
+    for (const auto& tokens : inputs) {
+        std::cout << "generating:\n---\n";
+        for (int t = 1; t < genT; t++) {
+            // Todo: add KV Cache for inference to remove re-calculations
+            mixtral_forward(model_ptr, gen_tokens, B, T);
+            auto probs = model_ptr->activs_ptr->probs[0][t - 1];
+            float coin = 0; // random_f32(&rng_state);
+            auto next_token = sample_mult(probs, model_ptr->config.vocab_size, coin);
+            gen_tokens[0][t] = next_token;
+            if (tokenizer.init_ok) {
+                auto token_str = tokenizer.decode();
+                tokenizer.print(token_str);
+            } else {
+                std::cout << "token id: " << next_token << "\n";
+            }
+            fflush(stdout);
+        }
+        std::cout << "\n---\n";
+    }
 
     // free
 
