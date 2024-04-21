@@ -1,16 +1,46 @@
 # llm.c
 
-LLM training in simple, pure C/CUDA. There is no need for 245MB of PyTorch or 107MB of cPython. For example, training GPT-2 (CPU, fp32) is ~1,000 lines of clean code in a single file. It compiles and runs instantly, and exactly matches the PyTorch reference implementation. I chose GPT-2 as the first working example because it is the grand-daddy of LLMs, the first time the modern stack was put together.
+LLM training in simple, pure C/CUDA. There is no need for 245MB of PyTorch or 107MB of cPython. Training GPT-2 (CPU, fp32) is ~1,000 lines of clean code in the single file [train_gpt2.c](train_gpt2.c), and training it on GPU is ~2,000 lines (adds CUDA kernels) in [train_gpt2.cu](train_gpt2.cu). The code compiles and runs instantly, it exactly matches the PyTorch reference implementation, and it ~matches the speed of (compiled) PyTorch (fp32, no flash attention). I chose GPT-2 as the first working example because it is the grand-daddy of LLMs, the first time the modern stack was put together.
 
-Currently, I am working on:
+Currently, we are working on:
 
-- direct CUDA implementation, which will be significantly faster and probably come close to PyTorch.
-- speed up the CPU version with SIMD instructions, AVX2 on x86 / NEON on ARM (e.g. Apple Silicon).
-- more modern architectures, e.g. Llama2, Gemma, etc.
+- optimize the CUDA implementation further to match/exceed PyTorch speed
+- lower the precision from fp32 to mixed precision training
+- add multi-gpu training, starting with DDP
+- reproduce the GPT-2 training run (add data, evals)
+- more modern architectures, Llama 2, Gemma, Mistral, etc.
 
-I'd like this repo to only maintain C and CUDA code. Ports of this repo to other programming languages are very welcome, but should be done in separate repos, and I am very happy to link to them below in the "notable forks" section, just like I did in [llama2.c notable forks](https://github.com/karpathy/llama2.c/tree/master?tab=readme-ov-file#notable-forks).
+I'd like this repo to only maintain C and CUDA code. Ports of this repo to other languages are very welcome, but should be done in separate repos, and then I am happy to link to them below in the "notable forks" section, just like I did in [llama2.c notable forks](https://github.com/karpathy/llama2.c/tree/master?tab=readme-ov-file#notable-forks).
 
-## quick start
+## quick start (GPU)
+
+The "I don't care about anything I just want to train and I have a GPU" section. Run:
+
+```bash
+pip install -r requirements.txt
+python prepro_tinyshakespeare.py
+python train_gpt2.py
+make train_gpt2cu
+./train_gpt2cu
+```
+
+The above lines (1) download the [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset, tokenize it with the GPT-2 Tokenizer, (2) download and save the GPT-2 (124M) weights, (3) init from them in C/CUDA and train for one epoch on tineshakespeare with AdamW (using batch size 4, context length 1024, total of 74 steps), evaluate validation loss, and sample some text.
+
+## quick start (CPU)
+
+The "I am so GPU poor that I don't even have one" section. No worries, run:
+
+```bash
+pip install -r requirements.txt
+python prepro_tinyshakespeare.py
+python train_gpt2.py
+make train_gpt2
+OMP_NUM_THREADS=8 ./train_gpt2
+```
+
+The above lines (1) download the [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset, tokenize it with the GPT-2 Tokenizer, (2) download and save the GPT-2 (124M) weights, (3) init from them in C and train for 40 steps on tineshakespeare with AdamW (using batch size 4, context length only 64), evaluate validation loss, and sample some text. Honestly, unless you have a beefy CPU (and can crank up the number of OMP threads in the launch command), you're not going to get that far on CPU training LLMs, but it might be a good demo/reference.
+
+## training: more detail
 
 Download and tokenize a dataset. The [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset is the fastest to download and tokenize:
 
@@ -107,70 +137,124 @@ This now loads the `gpt2_124M_debug_state.bin` file, runs a forward pass, compar
 
 I attached a very small tutorial here, in [doc/layernorm/layernorm.md](doc/layernorm/layernorm.md). It's a simple, step-by-step guide to implementing a single layer of the GPT-2 model, the layernorm layer. This is a good starting point to understand how the layers are implemented in C.
 
-## cuda
+## CUDA
 
-CUDA port is WIP, I'm keeping the growing collection of kernels in the `dev` folder, e.g. see [dev/cuda/README.md](dev/cuda/README.md).
+The full training loop is also implemented in pure CUDA in one file, but optimizations of the kernels are ongoing. Currently, we roughly match the speed of PyTorch. The way we organize code is that we have a growing collection of kernels of increasing complexity in the `dev/cuda` folder, see [dev/cuda/README.md](dev/cuda/README.md). We then copy paste the best kernels into the main training loop in the single training file `train_gpt2cu.cu`.
 
-As of April 10, 2024 the full forward pass is now implemented in pure CUDA in one file. First we can check that all of the logits and the final loss matches the PyTorch reference:
+**Correctness**. First, we can do 10 iterations of training and verify that our code exactly matches and preproduces the numbers from PyTorch:
 
 ```bash
 make test_gpt2cu
 ./test_gpt2cu
 ```
 
-This prints `overall okay: 1`. Now that we are calculating all the right values, we can time our code. We can't train yet because the backward pass + update are not implemented yet, but we can run the training loop and see the timings:
+This prints `overall okay: 1`. So the forward activations, backward gradients, and the individual loss values for 10 iterations all match exactly.
+
+**Training**. To train GPT-2 in a single file of CUDA, run the train script:
 
 ```bash
 make train_gpt2cu
 ./train_gpt2cu
 ```
 
-This will run GPT-2 (124M) in one file of pure CUDA (see [train_gpt2.cu](train_gpt2.cu)), using batch size 4 and sequence length 1024. This will print a bunch of hyperparameters and then the "training":
+This will load the tiny_shakespeare dataset validation and training splits. At the default settings of B=4, T=1024, there are 8 validation batches and 74 training batches. The script is currently configured to do a single epoch of finetuning with learning rate 1e-4, and along the way it evaluates the validation performance and generates samples, e.g.:
 
 ```
-val loss 4.517179
-step 0: train loss 4.367631 (took 25.868564 ms)
-step 1: train loss 4.406341 (took 26.112257 ms)
-step 2: train loss 4.484756 (took 26.124789 ms)
-step 3: train loss 4.345182 (took 26.149837 ms)
+step 1/74: train loss 4.367631 (80.639749 ms)
+step 2/74: train loss 4.031242 (77.378867 ms)
+step 3/74: train loss 4.034144 (77.315861 ms)
+step 4/74: train loss 3.859865 (77.357575 ms)
 ...
+step 72/74: train loss 3.085081 (78.850895 ms)
+step 73/74: train loss 3.668018 (78.197064 ms)
+step 74/74: train loss 3.467508 (78.009975 ms)
+val loss 3.516490
+generating:
+---
+?Where will you go?
+I take you wherefore I can, myself, and must.
+I cast off my beak, that I may look him up on the point;
+For on his rock shall he be opencast.
+
+<|endoftext|>My little nephew:
+Keep on with me, my
 ```
 
-The loss is changing because we are still loading real data batches from our dataset, but there is no training so they won't go down over time. In any case, on my A100 40GB PCIe GPU we are seeing about 28ms/iteration. We can compare this to PyTorch fp32 training by calling our python script like this:
+This runs on my A100 in about ~10 seconds. This training loop in the PyTorch script is about 80ms/iteration, so we are slightly better than PyTorch here. However, this is measured with PyTorch that is a bit stale (I'm on 2.1.0) and we're not yet including FlashAttention or the PyTorch scaled_dot_product_attention fused operation.
+
+We can compare to naive PyTorch like this, where we turn on `torch.compile` and the use of TensorCores, which use tf32 type:
 
 ```bash
-python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024 --batch_size 4
+python train_gpt2.py --write_tensors 0 --sequence_length 1024 --batch_size 4 --compile 1 --tensorcores 1
 ```
 
-Which shows time per iteration with the same hyperparameters (batch 4, time 1024) at 104ms/iteration. We can then enable `torch.compile` by adding the `--compile 1` flag:
+The compilation (first iteration) is ~27 seconds, but after that on my A100 this currently runs at ~80ms/iteration.
+
+## experiments / sweeps
+
+Now that the basic argparse and logging functionality is there in the .cu script, we can do our first learning rate sweeps. This is fairly manual right now, but just to document one example process to sweep learning rates on a machine with 4 GPUs on TinyStories. Run a shell script `sweep.sh` (after you of course `chmod u+x sweep.sh`):
 
 ```bash
-python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024 --batch_size 4 --compile 1
+#!/bin/bash
+
+learning_rates=(3e-5 1e-4 3e-4 1e-3)
+
+for i in {0..3}; do
+    export CUDA_VISIBLE_DEVICES=$i
+    screen -dmS "tr$i" bash -c "./train_gpt2cu -i data/TinyStories -v 250 -s 250 -g 144 -l ${learning_rates[$i]} -o stories$i.log"
+done
+
+# you can bring these down with
+# screen -ls | grep -E "tr[0-3]" | cut -d. -f1 | xargs -I {} screen -X -S {} quit
 ```
 
-And see that the first iteration now takes 20 seconds (compilation time), but all following iterations take ~86ms. And if we additionally turn on the use of fp32 tensorcores (only GPUs since Volta) with `--tensorcores 1`:
+This example opens up 4 screen sessions and runs the four commands with different LRs. This writes the log files `stories$i.log` with all the losses, which you can plot as you wish in Python. Here's a quick example script to plot the losses in a Jupyter notebook, obviously can become more sophisticated later:
 
-```bash
-python train_gpt2.py --inference_only 1 --write_tensors 0 --sequence_length 1024 --batch_size 4 --compile 1 --tensorcores 1
+```python
+import matplotlib.pyplot as plt
+%matplotlib inline
+
+def parse_log(logfile):
+  # look for lines like e.g. "s:100 tel:1.6952", step 100, val 1.6952
+    val_steps, val_losses = [], []
+    with open(logfile, "r") as f:
+        lines = f.readlines()
+    for line in lines:
+        if "tel" in line:
+            parts = line.split()
+            step = parts[0].split(":")[1]
+            loss = parts[1].split(":")[1]
+            val_steps.append(int(step))
+            val_losses.append(float(loss))
+    return val_steps, val_losses
+
+results = [parse_log(f"stories{i}.log") for i in range(0, 4)]
+for i, (val_steps, val_losses) in enumerate(results):
+    plt.plot(val_steps, val_losses, label="run {}".format(i))
+plt.xlabel("steps")
+plt.ylabel("loss")
+plt.legend()
 ```
-
-The time drops down to 26.2ms/iteration. So at the current 26.2ms/iteration we, amusingly and right now, have an identical running time. This somewhat makes sense because most of the FLOPs are in the matmul, and we both call about the same kernels. The remainder of the difference is likely our self-attention implementation, and possibly the round trips for GeLU, and permute/unpermute.
 
 ## repo philosophy
 
 A few more words on what I want this repo to be:
 
-First, I want `llm.c` to be a place for education. E.g. our `dev/cuda` folder is a place for a library of kernels for all the layers that are manually hand-written, starting from very simple kernels all the way to more complex / faster kernels. If you have a new kernel with various different tradeoffs, please feel free to contribute it here.
+First, I want `llm.c` to be a place for education. E.g. our `dev/cuda` folder is a place for a library of kernels for all the layers that are manually hand-written and very well documented, starting from very simple kernels all the way to more complex / faster kernels. If you have a new kernel with various different tradeoffs, please feel free to contribute it here.
 
-That said, I also want `llm.c` to have teeth. I want this repo to be very fast, and even practically useful to train some actual networks. E.g. the goal I have in mind right now is that we should be able to reproduce the full/big GPT-2 (1.6B) training run in reasonable time. This requires that we incorporate whatever fastest kernels there are, from cuBLAS, cuBLASLt, CUTLASS, cuDNN, whatever exists. I also think this serves an educational purpose as an upper bound, and a unit of measurement, e.g. you could say that your manually written kernels are 80% of cuBLAS speed, etc. Then you can choose to do a super fast run, or you can choose to "drag and drop" whatever manual kernels you wish to use, and run with those.
+That said, I also want `llm.c` to be very fast too, even practically useful to train networks. E.g. to start, we should be able to reproduce the big GPT-2 (1.6B) training run. This requires that we incorporate whatever fastest kernels there are, including the use of libraries such as cuBLAS, cuBLASLt, CUTLASS, cuDNN, etc. I also think doing so serves an educational purpose to establish an expert upper bound, and a unit of measurement, e.g. you could say that your manually written kernels are 80% of cuBLAS speed, etc. Then you can choose to do a super fast run, or you can choose to "drag and drop" whatever manual kernels you wish to use, and run with those.
 
-However, as a constraint, I want to keep the mainline `llm.c` in the root folder simple and readable. If there is a PR that e.g. improves performance by 2% but it "costs" 500 lines of complex C code, and maybe an exotic 3rd party dependency, I may reject the PR because the complexity is not worth it. In that sense I'd be ok to only be at e.g. 90% of PyTorch speed, if it means we can remain at ~2,000 readable lines of code with minimal exotic dependencies. As a concrete example - adding cuBLAS for matmuls is a no-brainer: it makes the mainline code much faster, it is a single line of interpretable code, and it is a very common dependency.
+However, as a constraint, I want to keep the mainline `llm.c` in the root folder simple and readable. If there is a PR that e.g. improves performance by 2% but it "costs" 500 lines of complex C code, and maybe an exotic 3rd party dependency, I may reject the PR because the complexity is not worth it. In that sense I'd be ok to only be at e.g. 90% of PyTorch speed, if it means we can remain at ~2,000 readable lines of code with minimal exotic dependencies. As a concrete example - making cuBLAS for matmuls the default in the root training loop is a no-brainer: it makes the mainline code much faster, it is a single line of interpretable code, and it is a very common dependency. On the side of this, we can have manual implementations that can compete with cuBLAS in `dev/cuda`.
 
-Lastly, I will be a lot more sensitive to introduced complexity in the root folder of the project, which contains the main / default files of the project. In comparison, the `dev/` folder is a bit more of a scratch space for us to develop a library of kernels or classes and share useful or related or educational code, and some of this code could be ok to be (locally) complex.
+Lastly, I will be a lot more sensitive to complexity in the root folder of the project, which contains the main / default files of the project. In comparison, the `dev/` folder is a bit more of a scratch space for us to develop a library of kernels or classes and share useful or related or educational code, and some of this code could be ok to be (locally) complex.
 
 ## notable forks
 
-will go here, similar to [llama2.c notable forks](https://github.com/karpathy/llama2.c/tree/master?tab=readme-ov-file#notable-forks)
+- Mojo
+  - [llm.🔥](https://github.com/dorjeduck/llm.mojo) by @[dorjeduck](https://github.com/dorjeduck): a Mojo port of this project
+
+- C#
+  - [llm.cs](https://github.com/azret/llm.cs) by @[azret](https://github.com/azret): a C# port of this project
 
 ## discussions
 
