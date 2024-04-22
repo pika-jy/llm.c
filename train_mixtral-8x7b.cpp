@@ -9,6 +9,7 @@ This is the C++ version of the Mixtral-8x7B model.
 #include <memory>
 #include <algorithm>
 #include <numeric>
+#include <cmath>
 #include <functional>
 #ifdef OMP
 #include <omp.h>
@@ -37,19 +38,129 @@ namespace llm {
         void forward() {}
     };
 
+    template <typename T>
     class RMSNorm: public Module {
     public:
-        void forward() {}
+        /*
+        llama:
+        def _norm(self, x):
+            return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        def forward(self, x):
+            output = self._norm(x.float()).type_as(x)
+            return output * self.weight
+        */
+        void forward(vector<vecotr<vector<T>>>& output,
+                     const vector<vector<vector<T>>>& input,
+                     const vector<T>& rstd,
+                     const vector<T>& weight,
+                     const vector<T>& bias,
+                     int B, int S, int C) {
+            /*
+            LayerNorm paper: https://arxiv.org/pdf/1607.06450.pdf
+            RMSNorm paper: https://arxiv.org/pdf/1910.07467.pdf
+            RMSNorm is a simplification of the LayerNorm, removes mean (re-center)            
+            output: (B, S, C) activations
+            input: (B, S, C) activations
+            rstd are (B, S) buffers, to be used later in backward pass
+            at each position (b, t) of the input, the C-dimensional vector
+            of activations gets normalized, then scaled and shifted
+            */
+            float eps = 1e-6f;
+            #pragma omp parallel for collapse(2)
+            for (int b = 0; b < B; ++b) {
+                for (int t = 0; t < S; ++t) {
+                    const auto& input_bt = input[b][t];
+                    auto& output_bt = output[b][t];
+
+                    // variance
+                    T varval = 0.0f;
+                    for_each(input_bt.begin(), input_bt.end(), [&](const auto& v){
+                        varval += powf(v, 2);
+                    });
+                    varval /= C;
+
+                    // rstd (reciprocal standard deviation)
+                    T rstd = 1.0f / sqrtf(varval + eps);
+
+                    // normalize, scale and shift
+                    for (int c = 0; c < C; ++c) {
+                        auto& v = output_bt[b][t][c];
+                        v *= rstd; // normalize
+                        v = v * weight[c] + bias[c]; // scale and shift
+                    }
+                }
+            }
+        }
+        void backward() {}
     };
 
+    template <typename T>
     class Matmul: public Module {
     public:
-        void forward() {}
+        void forward(vector<vector<vector<T>>>& output
+                     const vector<vector<vector<T>>>& input,
+                     vector<vector<T>>& weight,
+                     vector<T>& bias,
+                     int B, int S, int C, int OC) {
+            /*
+            output: (B, S, OC)
+            input: (B, S, C)
+            weight: (OC, C)
+            bias: (OC)
+            */
+            #pragma omp parallel for collpase(2)
+            for (int b = 0; b < B; ++b) {
+                for (int t = 0; t < S, ++t) {
+                    const auto& input_bt = input[b][t];
+                    auto& output_bt = output[b][t];
+
+                    for (int oc = 0; oc < OC; ++oc) {
+                        auto& v = output_bt[b][t][oc];
+                        v = inner_product(input_bt.cbegin(), input_bt.cend(), weight.cbegin(), 0.f);
+                        v += bias[oc];
+                    }
+                }
+            }
+        }
+        void backward() {}
     };
 
+    template <typename T>
     class Attention: public Module {
     public:
-        void forward() {}
+        void forward(vector<vecotr<vector<T>>>& output,
+                     const vector<vecotr<vector<T>>>& input,
+                     vector<vecotr<vector<vector<T>>>>& preatt,
+                     vector<vecotr<vector<vector<T>>>>& att,
+                     int B, int S, int C, int NH) {
+            /*
+            input is (B, S, 3C) holding the query, key, value (Q, K, V) vectors
+            preatt, att are (B, NH, S, S). NH = number of heads, S = sequence length
+            that holds the pre-attention and post-attention scores (used in backward)
+            output is (B, S, C)
+            attention is the only layer that mixes information across time
+            every other operation is applied at every (b,t) position independently
+            (and of course, no layer mixes information across batch)
+            */
+            int C3 = C * 3;
+            int HD = C / NH; // head dim
+            T norm_factor = 1.0 / sqrtf(HD);
+
+            #pragma omp parallel for collapse(3)
+            for (int b = 0; b < B; b++) {
+                for (int t = 0; t < S; t++) {
+                    for (int h = 0; h < NH; h++) {
+                        // Q @ K_T
+
+                        // Apply mask
+                        
+                        // Softmax
+
+                        // Score @ V
+                    }
+                }
+            }
+        }
     };
 
     class SparseMoE: public Module {
@@ -59,12 +170,41 @@ namespace llm {
 
     class SiLU: public Module {
     public:
-        void forward() {}
+        void forward() {
+
+        }
+        void backward() {}
     };
 
+    template <typename T>
     class Residual: public Module {
     public:
-        void forward() {}
+        void forward(vector<vecotr<vector<T>>>& output,
+                     const vector<vecotr<vector<T>>>& input1,
+                     const vector<vecotr<vector<T>>>& input2,
+                     int B, int S, int C) {
+            for (int i = 0; i < N; i++) {
+                out[i] = inp1[i] + inp2[i];
+            }
+             /*
+            output: (B, S, C)
+            input1: (B, S, C)
+            input2: (B, S, C)
+            */
+            #pragma omp parallel for collpase(2)
+            for (int b = 0; b < B; ++b) {
+                for (int t = 0; t < S, ++t) {
+                    const auto& input1_bt = input1[b][t];
+                    const auto& input2_bt = input2[b][t];
+                    auto& output_bt = output[b][t];
+
+                    for (int c = 0; c < C; ++c) {
+                        output_bt[c] = input1_bt[c] + input2_bt[c];
+                    }
+                }
+            }
+        }
+        void backward() {}
     };
 
     template <typename T>
@@ -72,15 +212,15 @@ namespace llm {
     public:
         void forward(vector<vector<vector<T>>>& probs,
                      const vector<vector<vector<T>>>& logits,
-                     int B, int T, int V) {
+                     int B, int S, int V) {
             /*
-            output: probs, (B, T, V) of the probabilities (sums to 1.0 in each b,t position)
-            input: logits, (B, T, V) of the unnormalized log probabilities
+            output: probs, (B, S, V) of the probabilities (sums to 1.0 in each b,t position)
+            input: logits, (B, S, V) of the unnormalized log probabilities
             */
             #pragma omp parallel for collapse(2)
-            vector<float> submax(V, 0.0f);
+            vector<T> submax(V, 0.0f);
             for (int b = 0; b < B; ++b) {
-                for (int t = 0; t < T, ++t) {
+                for (int t = 0; t < S, ++t) {
                     submax.clear();
 
                     // softmax(logits) -> probs
@@ -92,13 +232,21 @@ namespace llm {
                     for (int i = 0; i < V; ++i) {
                         submax[i] = logits_bt[i] - maxval;
                     }
+
+                    // sum as the denomiator
                     auto sum = accumulate(submax);
-                    for (int i = 0; i < V; ++i) {
-                        submax[i] /= sum;
-                    }
+                    
+                    // divide by sum
+                    for_each(submax.begin(), submax.end(), [&](auto& v){
+                        v /= sum;
+                    });
+                    // for (int i = 0; i < V; ++i) {
+                    //     submax[i] /= sum;
+                    // }
                 }
             }
         }
+        void backward() {}
     };
 }
 
