@@ -6,6 +6,7 @@ This is the C++ version of the Mixtral-8x7B model.
 
 #include <iostream>
 #include <vector>
+#include <string>
 #include <memory>
 #include <algorithm>
 #include <numeric>
@@ -78,12 +79,15 @@ namespace llm {
             }
         }
         */
-        void WPERoPE(int C) {
-            this->inv_freq.resize(C / 2);
+        void WPERoPE(int HD) {
+            /*
+            HD: head dim
+            */
+            this->inv_freq.resize(HD / 2);
             T n = 0;
             generate(this->inv_freq.begin(), this->inv_freq.end(), [&n](){
                 n += 2;
-                return 1.0f / powf(base, n / C);
+                return 1.0f / powf(base, n / HD);
             });
 
             this->set_cos_sin_cache(this->max_seq_len);
@@ -120,15 +124,32 @@ namespace llm {
             output: (B, NH, S, HD)
             input: (B, NH, S, HD)
             */
-            // generate inv_freq
+            int HD = C / NH; // head dim
+            assert(HD % 2 == 0), string("head dim needs to be divisible by 2");
+
+            #pragma omp parallel for collapse(2)
             for (int b = 0; b < B; ++b) {
                 for (int t = 0; t < S; ++t) {
                     const auto& input_bt = input[b][t];
                     auto& output_bt = output[b][t];
+
+                    // embed = x * cos + rotate_half(x) * sin
+                    // x * cos
+                    for (int c = 0; i < HD; ++i) {
+                        output_bt[c] = input_bt[c] * this->cos_cached.at(c);
+                    }
+                    // rotate_half(x) * sin
+                    int offset = HD / 2;
+                    for (int c = 0; i < offset; ++i) {
+                        output_bt[c] -= input_bt[c + offset] * this->sin_cached.at(c);
+                    }
+                    for (int c = offset; i < HD; ++i) {
+                        output_bt[c] += input_bt[c - offset] * this->sin_cached.at(c);
+                    }
                 }
             }
         }
-        
+
         void backward() {}
 
     private:
@@ -158,7 +179,7 @@ namespace llm {
             /*
             LayerNorm paper: https://arxiv.org/pdf/1607.06450.pdf
             RMSNorm paper: https://arxiv.org/pdf/1910.07467.pdf
-            RMSNorm is a simplification of the LayerNorm, removes mean (re-center)            
+            RMSNorm is a simplification of the LayerNorm, removes mean (re-center)
             output: (B, S, C) activations
             input: (B, S, C) activations
             rstd are (B, S) buffers, to be used later in backward pass
@@ -255,7 +276,7 @@ namespace llm {
                         // Q @ K_T
 
                         // Apply mask
-                        
+
                         // Softmax
 
                         // Score @ V
@@ -341,7 +362,7 @@ namespace llm {
 
                     // sum as the denomiator
                     auto sum = accumulate(submax);
-                    
+
                     // divide by sum
                     for_each(submax.begin(), submax.end(), [&](auto& v){
                         v /= sum;
