@@ -28,14 +28,115 @@ namespace llm {
         virtual void backward() = 0;
     };
 
+    template <typename T>
     class WTE: public Module {
     public:
-        void forward() {}
+        void forward(vector<vector<vector<T>>>& output,
+                     const vector<vector<T>>& input,
+                     const vector<vector<T>>& wte,
+                     int B, int S, int C) {
+            /*
+            output: (B, S, C)
+            input: (B, S)
+            wte: (V, C)
+            */
+            #pragma omp parallel collapse(2)
+            for (int b = 0; b < B; ++b) {
+                for (int t = 0; t < S; ++t) {
+                    const auto& input_bt = input[b][t];
+                    const auto& wte_t = wte[t];
+                    auto& output_bt = output[b][t];
+
+                    for (int c = 0; c < C; ++c) {
+                        output_bt[c] = input_bt[c] + wte_t[c];
+                    }
+                }
+            }
+        }
+
+        void backward() {}
     };
 
+    template <typename T>
     class WPERoPE: public Module {
     public:
-        void forward() {}
+        /*
+        // RoPE relative positional encoding: complex-valued rotate q and k in each head
+        for (int i = 0; i < dim; i+=2) {
+            int head_dim = i % head_size;
+            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+            float val = pos * freq;
+            float fcr = cosf(val);
+            float fci = sinf(val);
+            int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
+            for (int v = 0; v < rotn; v++) {
+                float* vec = v == 0 ? s->q : s->k; // the vector to rotate (query or key)
+                float v0 = vec[i];
+                float v1 = vec[i+1];
+                vec[i]   = v0 * fcr - v1 * fci;
+                vec[i+1] = v0 * fci + v1 * fcr;
+            }
+        }
+        */
+        void WPERoPE(int C) {
+            this->inv_freq.resize(C / 2);
+            T n = 0;
+            generate(this->inv_freq.begin(), this->inv_freq.end(), [&n](){
+                n += 2;
+                return 1.0f / powf(base, n / C);
+            });
+
+            this->set_cos_sin_cache(this->max_seq_len);
+        }
+
+        void set_cos_sin_cache(int S) {
+            vector<T> position(S);
+            itoa(position.begin(), position.end(), 0);
+            vector<vector<T>> freqs(S, vector<T>(this->inv_freq.size(), 0.f));
+            this->cos_cached.resize(S);
+            this->sin_cached.resize(S);
+
+            for (int t = 0; t < S; ++t) {
+                const auto& inv_freq_t = this->inv_freq[t];
+                auto& freqs_t = freqs[t];
+                auto& cos_cached_t = this->cos_cached[t];
+                auto& sin_cached_t = this->sin_cached[t];
+
+                for (int c = 0; c < this->inv_freq.size(); ++c) {
+                    auto& freq = freqs_t[c];
+                    freq = static_cast<T>(t) * this->inv_freq[c];
+                    this->cos_cached_t[c] = cos(freq);
+                    this->sin_cached_t[c] = sin(freq);
+                }
+            }
+        }
+
+        void forward(vecotr<vector<vector<vector<T>>>>& output,
+                     const vecotr<vector<vector<vector<T>>>>& input,
+                     int B, int S, int C, int NH) {
+            /*
+            RoPE paper: https://arxiv.org/pdf/2104.09864.pdf
+            Reference: https://github.com/lucidrains/rotary-embedding-torch
+            output: (B, NH, S, HD)
+            input: (B, NH, S, HD)
+            */
+            // generate inv_freq
+            for (int b = 0; b < B; ++b) {
+                for (int t = 0; t < S; ++t) {
+                    const auto& input_bt = input[b][t];
+                    auto& output_bt = output[b][t];
+                }
+            }
+        }
+        
+        void backward() {}
+
+    private:
+        static constexpr T base{10000.0f};
+        int max_seq_len{32768};
+        vector<T> inv_freq;
+        vector<T> cos_cached;
+        vector<T> sin_cached;
     };
 
     template <typename T>
@@ -53,7 +154,6 @@ namespace llm {
                      const vector<vector<vector<T>>>& input,
                      const vector<T>& rstd,
                      const vector<T>& weight,
-                     const vector<T>& bias,
                      int B, int S, int C) {
             /*
             LayerNorm paper: https://arxiv.org/pdf/1607.06450.pdf
@@ -82,15 +182,16 @@ namespace llm {
                     // rstd (reciprocal standard deviation)
                     T rstd = 1.0f / sqrtf(varval + eps);
 
-                    // normalize, scale and shift
+                    // normalize, scale
                     for (int c = 0; c < C; ++c) {
                         auto& v = output_bt[b][t][c];
                         v *= rstd; // normalize
-                        v = v * weight[c] + bias[c]; // scale and shift
+                        v *= weight[c]; // scale
                     }
                 }
             }
         }
+
         void backward() {}
     };
 
@@ -122,6 +223,7 @@ namespace llm {
                 }
             }
         }
+
         void backward() {}
     };
 
@@ -161,6 +263,8 @@ namespace llm {
                 }
             }
         }
+
+        void backward() {}
     };
 
     class SparseMoE: public Module {
@@ -173,6 +277,7 @@ namespace llm {
         void forward() {
 
         }
+
         void backward() {}
     };
 
@@ -204,6 +309,7 @@ namespace llm {
                 }
             }
         }
+
         void backward() {}
     };
 
@@ -246,6 +352,7 @@ namespace llm {
                 }
             }
         }
+
         void backward() {}
     };
 }
