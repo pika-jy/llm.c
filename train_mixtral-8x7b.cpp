@@ -251,71 +251,65 @@ namespace llm {
     template <typename T>
     class Attention: public Module {
     public:
-        void forward(vector<vecotr<vector<T>>>& output,
-                     const vector<vecotr<vector<T>>>& input,
+        void forward(vector<vector<vecotr<vector<T>>>>& output,
+                     const vector<vecotr<vector<vector<T>>>>& query,
+                     const vector<vecotr<vector<vector<T>>>>& key,
+                     const vector<vecotr<vector<vector<T>>>>& value,
                      const vector<vecotr<T>>& mask,
-                     vector<vecotr<vector<vector<T>>>>& preatt,
-                     vector<vecotr<vector<vector<T>>>>& att,
-                     int B, int S, int C, int NH) {
+                     int B, int S, int HD, int NH) {
             /*
-            input is (B, S, 3C) holding the query, key, value (Q, K, V) vectors
-            preatt, att are (B, NH, S, S). NH = number of heads, S = sequence length
-            that holds the pre-attention and post-attention scores (used in backward)
-            output is (B, S, C)
-            attention is the only layer that mixes information across time
-            every other operation is applied at every (b,t) position independently
-            (and of course, no layer mixes information across batch)
+            Multi Head Attention
+            output: (B, NH, S, HD)
+            query: (B, NH, S, HD)
+            key: (B, NH, S, HD)
+            value: (B, NH, S, HD)
+            mask: (S, S)
+            NH = number of heads, HD = head dim, S = sequence length
             */
-            int HD = C / NH; // head dim
             T norm_factor = 1.0 / sqrtf(HD);
 
             #pragma omp parallel for collapse(3)
             for (int b = 0; b < B; ++b) {
-                auto& preatt_b = preatt[b];
-                auto& att_b = att[b];
-
-                for (int t1 = 0; t1 < S; ++t1) {
-                    // Todo: optimize memory usage
-                    const auto& input_bt = input[b][t1];
-                    auto input_bt_start = input_bt.cbegin();
-                    auto input_bt_end = input_bt.end();
-                    const auto&& query_bt = vector<T>(input_bt_start, input_bt_start + C);
-                    const auto&& key_bt = vector<T>(input_bt_start + C, input_bt_start + 2 * C);
-                    const auto&& value_bt = vector<T>(input_bt_start + 2 * C, input_bt_end);
-                    auto& output_bt = output[b][t1];
+                for (int m = 0; m < NH; ++m) {
+                    const auto& query_bm = query[b][m];
+                    const auto& key_bm = key[b][m];
+                    const auto& value_bm = value[b][m];
+                    auto& output_bm = query[b][m];
                     
-                    for (int m = 0; m < NH; ++m) {
-                        const auto&& query_btm = vector<T>(query_bt.cbegin() + m * HD, query_bt.cbegin() + (m + 1) * HD);
-                        const auto&& key_btm = vector<T>(key_bt.cbegin() + m * HD, key_bt.cbegin() + (m + 1) * HD);
-                        const auto&& value_btm = vector<T>(value_bt.cbegin() + m * HD, value_bt.cbegin() + (m + 1) * HD);
-                        const auto& mask_t = mask[t1];
-                        auto& preatt_bmt1 = preatt_b[m][t1];
-                        auto& att_bmt1 = att_b[m][t1];
-
+                    // Todo: add flash attention v2
+                    for (int t_q = 0; t_q < S; ++t_q) {
+                        const auto& query_bmt = query_bm[t_q];
+                        const auto& mask_t = mask[t_q];
+                        auto& output_bmt = output_bm[t_q];
+                        
                         // Q @ K_T
-                        for (int t2 = 0; t2 < S; ++t2) {
-                            auto val = inner_product(query_btm.cbegin(), query_btm.cend(), key_btm.cbegin(), 0.f);
-                            val *= norm_factor; // scale
-                            preatt_bmt1[t2] = val;
-                        }
+                        for (t_kv = 0; t_kv < S; ++t_kv) {
+                            const auto& key_bmt = key_bm[t_kv];
+                            const auto& mask_tt = mask_t[t_kv];
+                            auto& output_bmtt = output_bmt[t_kv];
 
-                        // Apply causal mask
-                        for (int t2 = 0; t2 < S; ++t2) {
-                            preatt_bmt1[t2] += mask_t[t2];
+                            output_bmtt = inner_product(query_bmt.cbegin(), query_bmt.cend(), key_bmt.cbegin(), 0.f);
+                            output_bmtt *= norm_factor; // scale
+                            output_bmtt += mask_tt; // allpy mask
                         }
 
                         // Safe softmax (subtract maxval)
-                        auto maxval = max(preatt_bmt1.cbegin(), preatt_bmt1.cend());
-                        for (int t2 = 0; t2 < S; ++t2) {
-                            preatt_bmt1[t2] = expf(logits_bt[t2] - maxval);
-                        }
-                        auto expsum = accumulate(preatt_bmt1); // sum as the denomiator
-                        for_each(preatt_bmt1.begin(), preatt_bmt1.end(), [&](auto& v){ // divide by sum
-                            v /= expsum;
+                        auto maxval = max(output_bmt.cbegin(), output_bmt.cend());
+                        for_each(output_bmt.begin(), output_bmt.end(), [&maxval](auto& v) {
+                            v = expf(v - maxval); // exponent
+                        });
+                        auto expsum = accumulate(output_bmt); // sum as the denomiator
+                        for_each(output_bmt.begin(), output_bmt.end(), [&expsum](auto& v) {
+                            v /= expsum; // divide by sum
                         });
 
                         // Score @ V
+                        for (t_kv = 0; t_kv < S; ++t_kv) {
+                            const auto& value_bmt = value_bm[t_kv];
+                            auto& output_bmtt = output_bmt[t_kv];
 
+                            output_bmtt = inner_product(output_bmt.cbegin(), output_bmt.cend(), value_bmt.cbegin(), 0.f);
+                        }
                     }
                 }
             }
