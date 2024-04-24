@@ -23,8 +23,10 @@ using namespace std;
 // B = batch_size, T = sequence_length, C = channels, V = vocab_size
 
 namespace llm {
+    template <typename T>
     class Module {
     public:
+        // Todo: unify api
         virtual void forward() = 0;
         virtual void backward() = 0;
     };
@@ -318,15 +320,43 @@ namespace llm {
         void backward() {}
     };
 
+    template <typename T>
     class SparseMoE: public Module {
     public:
         void forward() {}
     };
 
+    template <typename T>
     class SiLU: public Module {
     public:
-        void forward() {
+        /*
+        // SwiGLU non-linearity
+        for (int i = 0; i < hidden_dim; i++) {
+            float val = s->hb[i];
+            // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+            val *= (1.0f / (1.0f + expf(-val)));
+            // elementwise multiply with w3(x)
+            val *= s->hb2[i];
+            s->hb[i] = val;
+        }
+        */
+        void forward(vector<vecotr<vector<T>>>& output,
+                     const vector<vecotr<vector<T>>>& input1,
+                     const vector<vecotr<vector<T>>>& input2,
+                     int B, int S, int C) {
+            #pragma omp parallel for
+            for (int b = 0; b < B; ++b) {
+                for (int t = 0; t < S; ++t) {
+                    const auto& in1_bt = input1[b][t];
+                    const auto& in2_bt = input2[b][t];
+                    auto& val = output[b][t];
 
+                    // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+                    val = in1_bt * (1.0f / (1.0f + expf(-in1_bt)));
+                    // elementwise multiply with w3(x)
+                    val *= in2_bt;
+                }
+            }
         }
 
         void backward() {}
