@@ -271,30 +271,51 @@ namespace llm {
 
             #pragma omp parallel for collapse(3)
             for (int b = 0; b < B; ++b) {
-                for (int t = 0; t < S; ++t) {
+                auto& preatt_b = preatt[b];
+                auto& att_b = att[b];
+
+                for (int t1 = 0; t1 < S; ++t1) {
                     // Todo: optimize memory usage
-                    const auto& input_bt = input[b][t];
+                    const auto& input_bt = input[b][t1];
                     auto input_bt_start = input_bt.cbegin();
                     auto input_bt_end = input_bt.end();
                     const auto&& query_bt = vector<T>(input_bt_start, input_bt_start + C);
                     const auto&& key_bt = vector<T>(input_bt_start + C, input_bt_start + 2 * C);
                     const auto&& value_bt = vector<T>(input_bt_start + 2 * C, input_bt_end);
+                    auto& output_bt = output[b][t1];
                     
                     for (int m = 0; m < NH; ++m) {
                         const auto&& query_btm = vector<T>(query_bt.cbegin() + m * HD, query_bt.cbegin() + (m + 1) * HD);
                         const auto&& key_btm = vector<T>(key_bt.cbegin() + m * HD, key_bt.cbegin() + (m + 1) * HD);
                         const auto&& value_btm = vector<T>(value_bt.cbegin() + m * HD, value_bt.cbegin() + (m + 1) * HD);
+                        const auto& mask_t = mask[t1];
+                        auto& preatt_bmt1 = preatt_b[m][t1];
+                        auto& att_bmt1 = att_b[m][t1];
 
                         // Q @ K_T
-                        auto val = inner_product(query_btm.cbegin(), query_btm.cend(), key_btm.cbegin(), 0.f);
-                        val *= norm_factor; // scale
+                        for (int t2 = 0; t2 < S; ++t2) {
+                            auto val = inner_product(query_btm.cbegin(), query_btm.cend(), key_btm.cbegin(), 0.f);
+                            val *= norm_factor; // scale
+                            preatt_bmt1[t2] = val;
+                        }
 
-                        // Apply mask
+                        // Apply causal mask
+                        for (int t2 = 0; t2 < S; ++t2) {
+                            preatt_bmt1[t2] += mask_t[t2];
+                        }
 
-
-                        // Softmax
+                        // Safe softmax (subtract maxval)
+                        auto maxval = max(preatt_bmt1.cbegin(), preatt_bmt1.cend());
+                        for (int t2 = 0; t2 < S; ++t2) {
+                            preatt_bmt1[t2] = expf(logits_bt[t2] - maxval);
+                        }
+                        auto expsum = accumulate(preatt_bmt1); // sum as the denomiator
+                        for_each(preatt_bmt1.begin(), preatt_bmt1.end(), [&](auto& v){ // divide by sum
+                            v /= expsum;
+                        });
 
                         // Score @ V
+
                     }
                 }
             }
@@ -359,32 +380,26 @@ namespace llm {
             output: probs, (B, S, V) of the probabilities (sums to 1.0 in each b,t position)
             input: logits, (B, S, V) of the unnormalized log probabilities
             */
+            // softmax(logits) -> probs
             #pragma omp parallel for collapse(2)
-            vector<T> submax(V, 0.0f);
             for (int b = 0; b < B; ++b) {
                 for (int t = 0; t < S, ++t) {
-                    submax.clear();
-
-                    // softmax(logits) -> probs
                     const auto& logits_bt = logits[b][t];
                     auto& probs_bt = probs[b][t];
 
                     // safe softmax (subtract maxval)
                     auto maxval = max(logits_bt.cbegin(), logits_bt.cend());
                     for (int i = 0; i < V; ++i) {
-                        submax[i] = logits_bt[i] - maxval;
+                        probs_bt[i] = expf(logits_bt[i] - maxval);
                     }
 
                     // sum as the denomiator
-                    auto sum = accumulate(submax);
+                    auto expsum = accumulate(probs_bt);
 
                     // divide by sum
-                    for_each(submax.begin(), submax.end(), [&](auto& v){
-                        v /= sum;
+                    for_each(probs_bt.begin(), probs_bt.end(), [&](auto& v){
+                        v /= expsum;
                     });
-                    // for (int i = 0; i < V; ++i) {
-                    //     submax[i] /= sum;
-                    // }
                 }
             }
         }
