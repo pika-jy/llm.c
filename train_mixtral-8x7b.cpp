@@ -253,6 +253,7 @@ namespace llm {
     public:
         void forward(vector<vecotr<vector<T>>>& output,
                      const vector<vecotr<vector<T>>>& input,
+                     const vector<vecotr<T>>& mask,
                      vector<vecotr<vector<vector<T>>>>& preatt,
                      vector<vecotr<vector<vector<T>>>>& att,
                      int B, int S, int C, int NH) {
@@ -265,17 +266,31 @@ namespace llm {
             every other operation is applied at every (b,t) position independently
             (and of course, no layer mixes information across batch)
             */
-            int C3 = C * 3;
             int HD = C / NH; // head dim
             T norm_factor = 1.0 / sqrtf(HD);
 
             #pragma omp parallel for collapse(3)
-            for (int b = 0; b < B; b++) {
-                for (int t = 0; t < S; t++) {
-                    for (int h = 0; h < NH; h++) {
+            for (int b = 0; b < B; ++b) {
+                for (int t = 0; t < S; ++t) {
+                    // Todo: optimize memory usage
+                    const auto& input_bt = input[b][t];
+                    auto input_bt_start = input_bt.cbegin();
+                    auto input_bt_end = input_bt.end();
+                    const auto&& query_bt = vector<T>(input_bt_start, input_bt_start + C);
+                    const auto&& key_bt = vector<T>(input_bt_start + C, input_bt_start + 2 * C);
+                    const auto&& value_bt = vector<T>(input_bt_start + 2 * C, input_bt_end);
+                    
+                    for (int m = 0; m < NH; ++m) {
+                        const auto&& query_btm = vector<T>(query_bt.cbegin() + m * HD, query_bt.cbegin() + (m + 1) * HD);
+                        const auto&& key_btm = vector<T>(key_bt.cbegin() + m * HD, key_bt.cbegin() + (m + 1) * HD);
+                        const auto&& value_btm = vector<T>(value_bt.cbegin() + m * HD, value_bt.cbegin() + (m + 1) * HD);
+
                         // Q @ K_T
+                        auto val = inner_product(query_btm.cbegin(), query_btm.cend(), key_btm.cbegin(), 0.f);
+                        val *= norm_factor; // scale
 
                         // Apply mask
+
 
                         // Softmax
 
