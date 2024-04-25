@@ -440,7 +440,7 @@ namespace llm {
 class ParameterTensors {
 public:
     vector<vector<float>> wte; // (V, C)
-    vector<vector<float>> wpe; // (maxT, C)
+    vector<vector<float>> wperope; // (maxT, C)
     vector<vector<float>> ln1w; // (L, C)
     vector<vector<float>> ln1b; // (L, C)
     vector<vector<vector<float>>> qkvw; // (L, 3*C, C)
@@ -461,6 +461,7 @@ public:
 class ActivationTensors {
 public:
     vector<vector<vector<float>>> embedded; // (B, T, C)
+    vector<vector<vector<float>>> embedded_rope; // (B, T, C)
     vector<vector<vector<vector<float>>>> ln1; // (L, B, T, C)
     vector<vector<vector<float>>> ln1; // (L, B, T)
     vector<vector<vector<float>>> ln1_mean; // (L, B, T)
@@ -546,16 +547,14 @@ public:
 
 void mixtral_build_from_checkpoint(shared_ptr<Mixtral>& model_ptr, const string checkpoint_path) {
     // read in model from a checkpoint file
-
+    
 }
 
 void mixtral_forward(shared_ptr<Mixtral>& model_ptr, const vector<vector<int>>& inputs, int B, int T) {
 
 }
 
-void mixtral_free() {
-
-}
+void mixtral_free() {}
 
 #ifndef TESTING
 
